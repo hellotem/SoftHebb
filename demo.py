@@ -145,18 +145,30 @@ class WeightNormDependentLR(optim.lr_scheduler._LRScheduler):
         self.power_lr = power_lr
         super().__init__(optimizer, last_epoch, verbose)
 
-    def get_lr(self):
-        if not self._get_lr_called_within_step:
-            warnings.warn("To get the last learning rate computed by the scheduler, "
-                          "please use `get_last_lr()`.", UserWarning)
-        new_lr = []
-        for i, group in enumerate(self.optimizer.param_groups):
+    def step(self):
+        for group in self.optimizer.param_groups:
             for param in group['params']:
-                # difference between current neuron norm and theoretical converged norm (=1) scales the initial lr
-                # initial_lr * |neuron_norm - 1| ** 0.5
-                norm_diff = torch.abs(torch.linalg.norm(param.view(param.shape[0], -1), dim=1, ord=2) - 1) + 1e-10
-                new_lr.append(self.initial_lr_groups[i] * (norm_diff ** self.power_lr)[:, None, None, None])
-        return new_lr
+                if param.grad is None:
+                    continue
+                # Compute per-filter (neuron) norms
+                norm_diff = torch.abs(torch.linalg.norm(param.view(param.shape[0], -1), dim=1) - 1) + 1e-10
+                tensor_lr = group["base_lr"] * (norm_diff ** self.power_lr)  # shape: [num_filters]
+                param._tensor_lr = tensor_lr.view(-1, 1, 1, 1)  # store for use in optimizer
+    # def get_lr(self):
+    #     if not self._get_lr_called_within_step:
+    #         warnings.warn("To get the last learning rate computed by the scheduler, "
+    #                       "please use `get_last_lr()`.", UserWarning)
+    #     new_lr = []
+    #     for i, group in enumerate(self.optimizer.param_groups):
+    #         for param in group['params']:
+    #             # difference between current neuron norm and theoretical converged norm (=1) scales the initial lr
+    #             # initial_lr * |neuron_norm - 1| ** 0.5
+    #             norm_diff = torch.abs(torch.linalg.norm(param.view(param.shape[0], -1), dim=1, ord=2) - 1) + 1e-10
+    #             # new_lr.append(self.initial_lr_groups[i] * (norm_diff ** self.power_lr)[:, None, None, None])
+    #             norm_diff = torch.abs(torch.linalg.norm(param.view(param.shape[0], -1), dim=1) - 1) + 1e-10
+    #             tensor_lr = group["base_lr"] * (norm_diff ** self.power_lr)  # shape: [num_filters]
+    #             param._tensor_lr = tensor_lr.view(-1, 1, 1, 1)  # store for use in optimizer
+    #     return new_lr
 
 
 class TensorLRSGD(optim.SGD):
@@ -197,6 +209,10 @@ class TensorLRSGD(optim.SGD):
                     else:
                         d_p = buf
 
+                if hasattr(p, "_tensor_lr"):
+                    p.add_(-p._tensor_lr * d_p)
+                else:
+                    p.add_(-group['lr'] * d_p)
                 p.add_(-group['lr'] * d_p)
         return loss
 
@@ -257,9 +273,9 @@ if __name__ == "__main__":
     model.to(device)
 
     unsup_optimizer = TensorLRSGD([
-        {"params": model.conv1.parameters(), "lr": -0.08, },  # SGD does descent, so set lr to negative
-        {"params": model.conv2.parameters(), "lr": -0.005, },
-        {"params": model.conv3.parameters(), "lr": -0.01, },
+        {"params": model.conv1.parameters(), "base_lr": -0.08, },  # SGD does descent, so set lr to negative
+        {"params": model.conv2.parameters(), "base_lr": -0.005, },
+        {"params": model.conv3.parameters(), "base_lr": -0.01, },
     ], lr=0)
     unsup_lr_scheduler = WeightNormDependentLR(unsup_optimizer, power_lr=0.5)
 
@@ -267,14 +283,15 @@ if __name__ == "__main__":
     sup_lr_scheduler = CustomStepLR(sup_optimizer, nb_epochs=50)
     criterion = nn.CrossEntropyLoss()
 
-    trainset = FastCIFAR10('./data', train=True, download=True)
+    trainset = FastCIFAR10('../data', train=True, download=True)
     unsup_trainloader = torch.utils.data.DataLoader(trainset, batch_size=10, shuffle=True, )
     sup_trainloader = torch.utils.data.DataLoader(trainset, batch_size=64, shuffle=True, )
 
-    testset = FastCIFAR10('./data', train=False)
+    testset = FastCIFAR10('../data', train=False)
     testloader = torch.utils.data.DataLoader(testset, batch_size=1000, shuffle=False)
 
     # Unsupervised training with SoftHebb
+    print('Unsupervised training...')
     running_loss = 0.0
     for i, data in enumerate(unsup_trainloader, 0):
         inputs, _ = data
@@ -290,7 +307,8 @@ if __name__ == "__main__":
         # optimize
         unsup_optimizer.step()
         unsup_lr_scheduler.step()
-
+        
+    print('Supervised classifier training...')
     # Supervised training of classifier
     # set requires grad false and eval mode for all modules but classifier
     unsup_optimizer.zero_grad()

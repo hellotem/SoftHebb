@@ -1,7 +1,6 @@
 name: softhebb
 channels:
   - pytorch
-  - fastchan
   - conda-forge
   - defaults
 dependencies:
@@ -59,7 +58,6 @@ dependencies:
   - einops=0.3.2=pyhd8ed1ab_0
   - entrypoints=0.3=pyhd8ed1ab_1003
   - expat=2.4.1=h2531618_2
-  - fastdownload=0.0.5=py_0
   - ffmpeg=4.3=hf484d3e_0
   - ffmpeg-python=0.2.0=py_0
   - filelock=3.0.12=pyh9f0ad1d_0
