@@ -11,7 +11,9 @@ import torch.nn.functional as F
 from torch.nn.modules.utils import _pair
 from torch.optim.lr_scheduler import StepLR
 import torchvision
-
+# from torchinfo import summary
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 
 class SoftHebbConv2d(nn.Module):
     def __init__(
@@ -46,43 +48,45 @@ class SoftHebbConv2d(nn.Module):
         self.t_invert = torch.tensor(t_invert)
 
     def forward(self, x):
-        x = F.pad(x, self.F_padding, self.padding_mode)  # pad input
-        # perform conv, obtain weighted input u \in [B, OC, OH, OW]
-        weighted_input = F.conv2d(x, self.weight, None, self.stride, 0, self.dilation, self.groups)
+        with torch.no_grad():
+            x = F.pad(x, self.F_padding, self.padding_mode)  # pad input
+            # perform conv, obtain weighted input u \in [B, OC, OH, OW]
+            weighted_input = F.conv2d(x, self.weight, None, self.stride, 0, self.dilation, self.groups)
 
-        if self.training:
-            # ===== find post-synaptic activations y = sign(u)*softmax(u, dim=C), s(u)=1 - 2*I[u==max(u,dim=C)] =====
-            # Post-synaptic activation, for plastic update, is weighted input passed through a softmax.
-            # Non-winning neurons (those not with the highest activation) receive the negated post-synaptic activation.
-            batch_size, out_channels, height_out, width_out = weighted_input.shape
-            # Flatten non-competing dimensions (B, OC, OH, OW) -> (OC, B*OH*OW)
-            flat_weighted_inputs = weighted_input.transpose(0, 1).reshape(out_channels, -1)
-            # Compute the winner neuron for each batch element and pixel
-            flat_softwta_activs = torch.softmax(self.t_invert * flat_weighted_inputs, dim=0)
-            flat_softwta_activs = - flat_softwta_activs  # Turn all postsynaptic activations into anti-Hebbian
-            win_neurons = torch.argmax(flat_weighted_inputs, dim=0)  # winning neuron for each pixel in each input
-            competing_idx = torch.arange(flat_weighted_inputs.size(1))  # indeces of all pixel-input elements
-            # Turn winner neurons' activations back to hebbian
-            flat_softwta_activs[win_neurons, competing_idx] = - flat_softwta_activs[win_neurons, competing_idx]
-            softwta_activs = flat_softwta_activs.view(out_channels, batch_size, height_out, width_out).transpose(0, 1)
-            # ===== compute plastic update Δw = y*(x - u*w) = y*x - (y*u)*w =======================================
-            # Use Convolutions to apply the plastic update. Sweep over inputs with postynaptic activations.
-            # Each weighting of an input pixel & an activation pixel updates the kernel element that connected them in
-            # the forward pass.
-            yx = F.conv2d(
-                x.transpose(0, 1),  # (B, IC, IH, IW) -> (IC, B, IH, IW)
-                softwta_activs.transpose(0, 1),  # (B, OC, OH, OW) -> (OC, B, OH, OW)
-                padding=0,
-                stride=self.dilation,
-                dilation=self.stride,
-                groups=1
-            ).transpose(0, 1)  # (IC, OC, KH, KW) -> (OC, IC, KH, KW)
+            if self.training:
+                # ===== find post-synaptic activations y = sign(u)*softmax(u, dim=C), s(u)=1 - 2*I[u==max(u,dim=C)] =====
+                # Post-synaptic activation, for plastic update, is weighted input passed through a softmax.
+                # Non-winning neurons (those not with the highest activation) receive the negated post-synaptic activation.
+                batch_size, out_channels, height_out, width_out = weighted_input.shape
+                # Flatten non-competing dimensions (B, OC, OH, OW) -> (OC, B*OH*OW)
+                flat_weighted_inputs = weighted_input.transpose(0, 1).reshape(out_channels, -1)
+                # Compute the winner neuron for each batch element and pixel
+                flat_softwta_activs = torch.softmax(self.t_invert * flat_weighted_inputs, dim=0)
+                flat_softwta_activs = - flat_softwta_activs  # Turn all postsynaptic activations into anti-Hebbian
+                win_neurons = torch.argmax(flat_weighted_inputs, dim=0)  # winning neuron for each pixel in each input
+                competing_idx = torch.arange(flat_weighted_inputs.size(1))  # indeces of all pixel-input elements
+                # Turn winner neurons' activations back to hebbian
+                flat_softwta_activs[win_neurons, competing_idx] = - flat_softwta_activs[win_neurons, competing_idx]
+                softwta_activs = flat_softwta_activs.view(out_channels, batch_size, height_out, width_out).transpose(0, 1)
+                # ===== compute plastic update Δw = y*(x - u*w) = y*x - (y*u)*w =======================================
+                # Use Convolutions to apply the plastic update. Sweep over inputs with postynaptic activations.
+                # Each weighting of an input pixel & an activation pixel updates the kernel element that connected them in
+                # the forward pass.
+                yx = F.conv2d(
+                    x.transpose(0, 1),  # (B, IC, IH, IW) -> (IC, B, IH, IW)
+                    softwta_activs.transpose(0, 1),  # (B, OC, OH, OW) -> (OC, B, OH, OW)
+                    padding=0,
+                    stride=self.dilation,
+                    dilation=self.stride,
+                    groups=1
+                ).transpose(0, 1)  # (IC, OC, KH, KW) -> (OC, IC, KH, KW)
 
-            # sum over batch, output pixels: each kernel element will influence all batches and output pixels.
-            yu = torch.sum(torch.mul(softwta_activs, weighted_input), dim=(0, 2, 3))
-            delta_weight = yx - yu.view(-1, 1, 1, 1) * self.weight
-            delta_weight.div_(torch.abs(delta_weight).amax() + 1e-30)  # Scale [min/max , 1]
-            self.weight.grad = delta_weight  # store in grad to be used with common optimizers
+                # sum over batch, output pixels: each kernel element will influence all batches and output pixels.
+                yu = torch.sum(torch.mul(softwta_activs, weighted_input), dim=(0, 2, 3))
+                delta_weight = yx - yu.view(-1, 1, 1, 1) * self.weight
+                delta_weight.div_(torch.abs(delta_weight).amax() + 1e-30)  # Scale [min/max , 1]
+                self.weight.grad = delta_weight  # store in grad to be used with common optimizers
+                # self.weight.grad = torch.zeros_like(delta_weight)
 
         return weighted_input
 
@@ -271,6 +275,7 @@ if __name__ == "__main__":
     device = torch.device('cuda:0')
     model = DeepSoftHebb()
     model.to(device)
+    # summary(model, input_size=(1, 3, 32, 32))
 
     unsup_optimizer = TensorLRSGD([
         {"params": model.conv1.parameters(), "base_lr": -0.08, },  # SGD does descent, so set lr to negative
@@ -283,31 +288,52 @@ if __name__ == "__main__":
     sup_lr_scheduler = CustomStepLR(sup_optimizer, nb_epochs=50)
     criterion = nn.CrossEntropyLoss()
 
-    trainset = FastCIFAR10('../data', train=True, download=True)
-    unsup_trainloader = torch.utils.data.DataLoader(trainset, batch_size=10, shuffle=True, )
-    sup_trainloader = torch.utils.data.DataLoader(trainset, batch_size=64, shuffle=True, )
+    transform_train = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+    ])
 
-    testset = FastCIFAR10('../data', train=False)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=1000, shuffle=False)
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+    ])
+
+# Load CIFAR-10 dataset
+    train_dataset = datasets.CIFAR10(root='../data', train=True, download=True, transform=transform_train)
+    test_dataset = datasets.CIFAR10(root='../data', train=False, download=True, transform=transform_test)
+
+# Create data loaders
+    batch_size = 16
+    sup_trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    unsup_trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    testloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    # trainset = FastCIFAR10('../data', train=True, download=True)
+    # unsup_trainloader = torch.utils.data.DataLoader(trainset, batch_size=10, shuffle=True, )
+    # sup_trainloader = torch.utils.data.DataLoader(trainset, batch_size=2, shuffle=True, )
+
+    # testset = FastCIFAR10('../data', train=False)
+    # testloader = torch.utils.data.DataLoader(testset, batch_size=10, shuffle=False)
 
     # Unsupervised training with SoftHebb
     print('Unsupervised training...')
     running_loss = 0.0
-    for i, data in enumerate(unsup_trainloader, 0):
-        inputs, _ = data
-        inputs = inputs.to(device)
+    for _ in range(1):
+        for i, data in enumerate(unsup_trainloader, 0):
+            inputs, _ = data
+            inputs = inputs.to(device)
 
-        # zero the parameter gradients
-        unsup_optimizer.zero_grad()
+            # zero the parameter gradients
+            unsup_optimizer.zero_grad()
 
-        # forward + update computation
-        with torch.no_grad():
-            outputs = model(inputs)
+            # forward + update computation
+            with torch.no_grad():
+                outputs = model(inputs)
 
-        # optimize
-        unsup_optimizer.step()
-        unsup_lr_scheduler.step()
-        
+            # optimize
+            unsup_optimizer.step()
+            unsup_lr_scheduler.step()
+
     print('Supervised classifier training...')
     # Supervised training of classifier
     # set requires grad false and eval mode for all modules but classifier
